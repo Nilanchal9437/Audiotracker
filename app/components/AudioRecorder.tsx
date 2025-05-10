@@ -1,520 +1,426 @@
 'use client';
 
-import { useState, useRef, useEffect, ChangeEvent } from 'react';
-import posthog, { PostHog } from 'posthog-js';
-
-// Initialize PostHog with feature flags
-if (typeof window !== 'undefined') {
-  posthog.init('phc_4W7WQxZcdY5qSao5UnHg2dGaDUOFwfAgQ9DCqXinonQ', {
-    api_host: 'https://app.posthog.com',
-    loaded: (loadedPostHog: PostHog) => {
-      if (process.env.NODE_ENV === 'development') loadedPostHog.debug();
-    },
-    persistence: 'localStorage',
-    bootstrap: {
-      distinctID: 'user-' + Date.now()
-    }
-  });
-}
-
-interface AudioData {
-  blob: Blob;
-  url: string;
-  timestamp: number;
-  deviceInfo: any;
-}
-
-interface AudioMetricsBatch {
-  sessionId: string;
-  metrics: Array<{
-    average: number;
-    peak: number;
-    timestamp: number;
-  }>;
-}
-
-interface AudioChunkBatch {
-  sessionId: string;
-  chunks: Array<{
-    size: number;
-    timestamp: number;
-  }>;
-}
-
-declare global {
-  interface Window {
-    webkitAudioContext: typeof AudioContext;
-  }
-}
+import { useState, useRef, useEffect } from 'react';
 
 export default function AudioRecorder() {
+  // Basic states
   const [isRecording, setIsRecording] = useState(false);
-  const [audioData, setAudioData] = useState<AudioData | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [showPermissionModal, setShowPermissionModal] = useState(false);
-  const [permissionError, setPermissionError] = useState<string | null>(null);
-  const [gainValue, setGainValue] = useState(1.5); // Default gain boost
-  
+  const [hasRecording, setHasRecording] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [audioLevel, setAudioLevel] = useState(0);
+  const [recordingMode, setRecordingMode] = useState<'microphone' | 'system'>('microphone');
+
+  // Refs
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
-  const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const gainNodeRef = useRef<GainNode | null>(null);
-  const audioDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(null);
-  const audioBufferSourceRef = useRef<AudioBufferSourceNode | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
-  const recordingSessionRef = useRef<string>('');
-  const metricsBufferRef = useRef<AudioMetricsBatch['metrics']>([]);
-  const chunksBufferRef = useRef<AudioChunkBatch['chunks']>([]);
-  const lastBatchSentRef = useRef<number>(Date.now());
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const animationFrameRef = useRef<number | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+
+  // Add browser API check
+  const [isBrowserSupported, setIsBrowserSupported] = useState(false);
 
   useEffect(() => {
+    // Check for browser support
+    const checkBrowserSupport = () => {
+      const hasMediaDevices = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+      const hasMediaRecorder = typeof window !== 'undefined' && 'MediaRecorder' in window;
+      const hasAudioContext = typeof window !== 'undefined' && ('AudioContext' in window || 'webkitAudioContext' in window);
+      
+      setIsBrowserSupported(hasMediaDevices && hasMediaRecorder && hasAudioContext);
+    };
+
+    checkBrowserSupport();
+  }, []);
+
+  // Cleanup function
+  useEffect(() => {
     return () => {
-      if (audioData?.url) {
-        URL.revokeObjectURL(audioData.url);
+      stopRecording();
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
       }
       if (audioContextRef.current) {
         audioContextRef.current.close();
       }
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+      if (audioRef.current?.src) {
+        URL.revokeObjectURL(audioRef.current.src);
+      }
     };
-  }, [audioData]);
+  }, []);
 
-  // Function to generate a unique session ID
-  const generateSessionId = () => {
-    return 'rec-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
+  const updateAudioLevel = () => {
+    if (!analyserRef.current || !isRecording) return;
+
+    const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
+    analyserRef.current.getByteFrequencyData(dataArray);
+
+    // Calculate average volume level
+    const average = dataArray.reduce((acc, val) => acc + val, 0) / dataArray.length;
+    setAudioLevel((average / 255) * 100);
+
+    animationFrameRef.current = requestAnimationFrame(updateAudioLevel);
   };
 
-  const sendBatchedData = () => {
-    const now = Date.now();
-    // Only send batch if it's been at least 2 seconds since last batch
-    if (now - lastBatchSentRef.current >= 2000) {
-      if (metricsBufferRef.current.length > 0) {
-        posthog.capture('audio_metrics_batch', {
-          sessionId: recordingSessionRef.current,
-          metrics: metricsBufferRef.current,
-          timestamp: now
-        });
-        metricsBufferRef.current = [];
-      }
+  // Get audio stream based on mode
+  const getAudioStream = async () => {
+    if (!isBrowserSupported) {
+      throw new Error('Your browser does not support audio recording');
+    }
 
-      if (chunksBufferRef.current.length > 0) {
-        posthog.capture('audio_chunks_batch', {
-          sessionId: recordingSessionRef.current,
-          chunks: chunksBufferRef.current,
-          timestamp: now
+    if (recordingMode === 'microphone') {
+      try {
+        return await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
         });
-        chunksBufferRef.current = [];
+      } catch (err) {
+        if (err instanceof Error) {
+          if (err.name === 'NotAllowedError') {
+            throw new Error('Microphone access was denied. Please allow microphone access to record.');
+          } else if (err.name === 'NotFoundError') {
+            throw new Error('No microphone found. Please connect a microphone and try again.');
+          } else if (err.name === 'NotSupportedError') {
+            throw new Error('Audio recording is not supported in your browser. Please try using Chrome or Edge.');
+          }
+        }
+        throw err;
       }
+    } else {
+      try {
+        // For system audio, we need to request both audio and video (but we'll only use audio)
+        const displayStream = await navigator.mediaDevices.getDisplayMedia({
+          audio: true,
+          video: {
+            width: 1,
+            height: 1,
+            frameRate: 1
+          }
+        });
 
-      lastBatchSentRef.current = now;
+        // Check if audio was included in the stream
+        const audioTrack = displayStream.getAudioTracks()[0];
+        if (!audioTrack) {
+          displayStream.getTracks().forEach(track => track.stop());
+          throw new Error('No system audio was selected. Please select a tab or window with audio and make sure to check "Share audio".');
+        }
+
+        // Create a new stream with only the audio track
+        const audioStream = new MediaStream([audioTrack]);
+        
+        // Stop the video track since we don't need it
+        displayStream.getVideoTracks().forEach(track => track.stop());
+        
+        return audioStream;
+      } catch (err) {
+        if (err instanceof Error) {
+          if (err.name === 'NotAllowedError') {
+            throw new Error('System audio sharing was denied. Please allow audio sharing and make sure to check "Share audio".');
+          } else if (err.name === 'NotSupportedError') {
+            throw new Error('System audio recording is not supported in your browser. Please try using Chrome or Edge.');
+          }
+        }
+        throw err;
+      }
     }
   };
 
-  const requestPermission = async () => {
-    const sessionId = generateSessionId();
-    recordingSessionRef.current = sessionId;
-
-    const deviceInfo = {
-      platform: navigator.platform,
-      userAgent: navigator.userAgent,
-      vendor: navigator.vendor,
-      isMac: /Mac/.test(navigator.platform),
-      isSafari: /^((?!chrome|android).)*safari/i.test(navigator.userAgent),
-      isChrome: /Chrome/.test(navigator.userAgent),
-      screenWidth: window.screen.width,
-      screenHeight: window.screen.height,
-      devicePixelRatio: window.devicePixelRatio,
-      sessionId
-    };
-
+  // Start recording function
+  const startRecording = async () => {
+    console.log('Starting recording...');
     try {
-      // Start PostHog recording session
-      posthog.startSessionRecording();
-      
-      posthog.capture('audio_recording_session_start', {
-        sessionId,
-        deviceInfo,
-        timestamp: Date.now()
-      });
+      setError(null);
+      chunksRef.current = [];
 
-      setPermissionError(null);
-      setShowPermissionModal(false);
-
-      // Request audio permissions
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          sampleRate: 44100,
-        }
-      });
-
-      posthog.capture('audio_permission_granted', {
-        sessionId,
-        deviceInfo
-      });
-
-      // Initialize Web Audio API
-      const AudioContext = window.AudioContext || window.webkitAudioContext;
-      audioContextRef.current = new AudioContext();
-
-      // Create audio processing pipeline
-      const source = audioContextRef.current.createMediaStreamSource(stream);
-      const gainNode = audioContextRef.current.createGain();
-      const destination = audioContextRef.current.createMediaStreamDestination();
-      
-      // Create audio processor for real-time analysis
-      const processor = audioContextRef.current.createScriptProcessor(2048, 1, 1);
-      
-      processor.onaudioprocess = (e) => {
-        const inputData = e.inputBuffer.getChannelData(0);
-        const dataArray = Array.from(inputData);
-        const sum = dataArray.reduce((acc, val) => acc + Math.abs(val), 0);
-        const average = sum / dataArray.length;
-        const peak = Math.max(...dataArray);
-        
-        // Add to metrics buffer instead of sending immediately
-        metricsBufferRef.current.push({
-          average,
-          peak,
-          timestamp: Date.now()
-        });
-        
-        // Try to send batch
-        sendBatchedData();
-      };
-
-      // Connect nodes
-      source
-        .connect(gainNode)
-        .connect(processor)
-        .connect(destination);
-      processor.connect(audioContextRef.current.destination);
-
-      // Store refs
-      audioSourceRef.current = source;
-      gainNodeRef.current = gainNode;
-      audioDestinationRef.current = destination;
-
-      // Configure MediaRecorder
-      const options = {
-        mimeType: 'audio/webm;codecs=opus',
-        bitsPerSecond: 128000
-      };
-
-      const mediaRecorder = new MediaRecorder(destination.stream, options);
-      mediaRecorderRef.current = mediaRecorder;
-      audioChunksRef.current = [];
-
-      // Start recording with timeslice parameter
-      mediaRecorder.start(500); // Record in 500ms chunks
-      setIsRecording(true);
-
-      mediaRecorder.ondataavailable = async (event) => {
-        if (event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
-          
-          // Instead of sending immediately, batch the chunk info
-          chunksBufferRef.current.push({
-            size: event.data.size,
-            timestamp: Date.now()
-          });
-          
-          // Try to send batch
-          sendBatchedData();
-        }
-      };
-
-      mediaRecorder.onstop = async () => {
-        // Force send any remaining batched data
-        sendBatchedData();
-        
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-        const audioUrl = URL.createObjectURL(audioBlob);
-        
-        const audioMetadata: AudioData = {
-          blob: audioBlob,
-          url: audioUrl,
-          timestamp: Date.now(),
-          deviceInfo
-        };
-        
-        setAudioData(audioMetadata);
-
-        // Send final recording data
-        posthog.capture('recording_completed', {
-          sessionId: recordingSessionRef.current,
-          duration: Date.now() - recordingStartTime,
-          finalSize: audioBlob.size,
-          timestamp: Date.now()
-        });
-
-        // Cleanup
-        if (audioContextRef.current) {
-          audioSourceRef.current?.disconnect();
-          gainNodeRef.current?.disconnect();
-          processor.disconnect();
-          audioContextRef.current.close();
-          audioContextRef.current = null;
-        }
-
-        stream.getTracks().forEach(track => track.stop());
-        posthog.stopSessionRecording();
-      };
-
-      const recordingStartTime = Date.now();
-
-    } catch (error) {
-      console.error('Recording error:', error);
-      
-      posthog.capture('recording_error', {
-        sessionId,
-        error: error instanceof Error ? error.message : 'Unknown error',
-        deviceInfo,
-        timestamp: Date.now()
-      });
-
-      let errorMessage = 'An error occurred while trying to record audio.';
-      if (error instanceof Error) {
-        if (error.name === 'NotAllowedError') {
-          errorMessage = 'Please grant microphone permission to record audio.';
-        } else if (error.name === 'NotFoundError') {
-          errorMessage = 'No microphone found. Please check your audio settings.';
-        }
+      if (!isBrowserSupported) {
+        throw new Error('Your browser does not support audio recording');
       }
 
-      setPermissionError(errorMessage);
-      setShowPermissionModal(true);
-      posthog.stopSessionRecording();
+      console.log(`Requesting ${recordingMode} access...`);
+      const stream = await getAudioStream();
+      console.log('Audio access granted');
+
+      // Set up audio context and analyzer
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      const audioContext = new AudioContextClass();
+      const analyser = audioContext.createAnalyser();
+      const source = audioContext.createMediaStreamSource(stream);
+      
+      analyser.fftSize = 256;
+      source.connect(analyser);
+      
+      audioContextRef.current = audioContext;
+      analyserRef.current = analyser;
+      streamRef.current = stream;
+
+      // Start monitoring audio levels
+      updateAudioLevel();
+
+      try {
+        // Create MediaRecorder with default settings first
+        const recorder = new MediaRecorder(stream);
+        
+        recorder.ondataavailable = (e) => {
+          if (e.data.size > 0) {
+            chunksRef.current.push(e.data);
+            console.log('Audio chunk received:', e.data.size, 'bytes');
+          }
+        };
+
+        recorder.onstart = () => {
+          console.log('Recording started successfully');
+          setIsRecording(true);
+          setError(null);
+        };
+
+        recorder.onstop = () => {
+          console.log('Recording stopped, processing audio...');
+          if (chunksRef.current.length === 0) {
+            setError('No audio data was recorded');
+            return;
+          }
+
+          try {
+            const audioBlob = new Blob(chunksRef.current, { type: 'audio/webm' });
+            console.log('Created audio blob:', audioBlob.size, 'bytes,', 'type:', audioBlob.type);
+            const audioUrl = URL.createObjectURL(audioBlob);
+            
+            if (audioRef.current) {
+              if (audioRef.current.src) {
+                URL.revokeObjectURL(audioRef.current.src);
+              }
+              audioRef.current.src = audioUrl;
+              setHasRecording(true);
+            }
+          } catch (err) {
+            console.error('Error creating audio blob:', err);
+            setError('Failed to process recorded audio');
+            return;
+          }
+
+          // Clean up
+          if (animationFrameRef.current) {
+            cancelAnimationFrame(animationFrameRef.current);
+          }
+          stream.getTracks().forEach(track => {
+            console.log('Stopping track:', track.kind, track.label);
+            track.stop();
+          });
+          setAudioLevel(0);
+          setIsRecording(false);
+        };
+
+        recorder.onerror = (event) => {
+          console.error('MediaRecorder error:', event);
+          setError(`Recording error: ${event.error?.message || 'Unknown error'}`);
+          setIsRecording(false);
+          setAudioLevel(0);
+          if (stream) {
+            stream.getTracks().forEach(track => track.stop());
+          }
+        };
+
+        mediaRecorderRef.current = recorder;
+        console.log('Starting MediaRecorder with settings:', {
+          mimeType: recorder.mimeType,
+          state: recorder.state
+        });
+        
+        recorder.start(100); // Collect data every 100ms for more frequent updates
+
+      } catch (err) {
+        console.error('Error creating MediaRecorder:', err);
+        throw new Error(`Failed to create audio recorder: ${err instanceof Error ? err.message : 'Unknown error'}`);
+      }
+
+    } catch (err) {
+      console.error('Error starting recording:', err);
+      setError(err instanceof Error ? err.message : 'Failed to start recording');
+      setIsRecording(false);
+      setAudioLevel(0);
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+      }
+      if (audioContextRef.current) {
+        audioContextRef.current.close();
+      }
     }
   };
 
-  const adjustGain = (e: ChangeEvent<HTMLInputElement>) => {
-    const value = Number(e.target.value);
-    setGainValue(value);
-    if (gainNodeRef.current) {
-      gainNodeRef.current.gain.value = value;
-    }
-  };
-
-  const startRecording = () => {
-    setShowPermissionModal(true);
-  };
-
+  // Stop recording function
   const stopRecording = () => {
-    if (mediaRecorderRef.current && isRecording) {
+    console.log('Stopping recording...');
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       mediaRecorderRef.current.stop();
       setIsRecording(false);
     }
   };
 
-  const playRecording = async () => {
-    if (!audioData) return;
-
-    try {
-      const sessionId = generateSessionId();
-      posthog.capture('playback_started', {
-        sessionId,
-        originalRecordingSession: recordingSessionRef.current,
-        timestamp: Date.now()
-      });
-
-      if (!audioContextRef.current) {
-        audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
-      }
-
-      const response = await fetch(audioData.url);
-      const arrayBuffer = await response.arrayBuffer();
-      const audioBuffer = await audioContextRef.current.decodeAudioData(arrayBuffer);
-
-      if (audioBufferSourceRef.current) {
-        audioBufferSourceRef.current.stop();
-      }
-
-      const source = audioContextRef.current.createBufferSource();
-      source.buffer = audioBuffer;
-      
-      // Create analyzer for playback monitoring
-      const analyzer = audioContextRef.current.createAnalyser();
-      analyzer.fftSize = 2048;
-      const bufferLength = analyzer.frequencyBinCount;
-      const dataArray = new Uint8Array(bufferLength);
-
-      source.connect(analyzer);
-      analyzer.connect(audioContextRef.current.destination);
-
-      // Monitor playback and send metrics to PostHog
-      const monitorPlayback = () => {
-        if (!isPlaying) return;
-        
-        analyzer.getByteFrequencyData(dataArray);
-        const average = dataArray.reduce((acc, val) => acc + val, 0) / bufferLength;
-        
-        posthog.capture('playback_metrics', {
-          sessionId,
-          average,
-          timestamp: Date.now()
-        });
-
-        requestAnimationFrame(monitorPlayback);
-      };
-
-      source.onended = () => {
-        setIsPlaying(false);
-        posthog.capture('playback_completed', {
-          sessionId,
-          timestamp: Date.now()
-        });
-      };
-      
-      audioBufferSourceRef.current = source;
-      source.start(0);
-      setIsPlaying(true);
-      monitorPlayback();
-
-    } catch (error) {
-      console.error('Playback error:', error);
-      posthog.capture('playback_error', {
-        error: error instanceof Error ? error.message : 'Unknown error',
-        timestamp: Date.now()
-      });
-      alert('Error playing the recording. Please try again.');
+  // Play audio function
+  const playAudio = () => {
+    console.log('Playing audio...');
+    if (!audioRef.current?.src) {
+      setError('No recording available to play');
+      return;
     }
+
+    audioRef.current.play()
+      .then(() => {
+        console.log('Audio playback started');
+        setIsPlaying(true);
+        setError(null);
+      })
+      .catch((err) => {
+        console.error('Playback error:', err);
+        setError('Failed to play audio: ' + (err instanceof Error ? err.message : 'Unknown error'));
+        setIsPlaying(false);
+      });
   };
 
-  const stopPlayback = () => {
-    if (audioBufferSourceRef.current) {
-      audioBufferSourceRef.current.stop();
+  // Stop audio function
+  const stopAudio = () => {
+    console.log('Stopping audio...');
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.currentTime = 0;
       setIsPlaying(false);
     }
   };
 
   return (
-    <div className="flex flex-col items-center gap-4 p-6 bg-white rounded-lg shadow-lg relative">
-      {showPermissionModal && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white p-6 rounded-lg shadow-xl max-w-md w-full mx-4">
-            <h3 className="text-xl font-bold mb-4">Audio Permission Required</h3>
-            {permissionError ? (
-              <div>
-                <p className="text-red-500 mb-4">{permissionError}</p>
-                <div className="flex justify-end gap-2">
-                  <button
-                    onClick={() => setShowPermissionModal(false)}
-                    className="px-4 py-2 text-gray-600 hover:text-gray-800"
-                  >
-                    Close
-                  </button>
-                  <button
-                    onClick={requestPermission}
-                    className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
-                  >
-                    Try Again
-                  </button>
-                </div>
+    <div className="flex flex-col items-center gap-4 p-6 bg-white rounded-lg shadow-lg">
+      <h2 className="text-2xl font-bold mb-4">Audio Recorder</h2>
+
+      {!isBrowserSupported ? (
+        <div className="w-full p-4 mb-4 bg-yellow-100 text-yellow-800 rounded">
+          <p className="font-medium">Browser Not Supported</p>
+          <p>Your browser does not support audio recording. Please use a modern browser like Chrome or Edge.</p>
+        </div>
+      ) : (
+        <>
+          {/* Recording mode selector */}
+          <div className="flex gap-2 mb-4">
+            <button
+              onClick={() => setRecordingMode('microphone')}
+              className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                recordingMode === 'microphone'
+                  ? 'bg-blue-500 text-white'
+                  : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+              }`}
+              disabled={isRecording || !isBrowserSupported}
+            >
+              Microphone
+            </button>
+            <button
+              onClick={() => setRecordingMode('system')}
+              className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                recordingMode === 'system'
+                  ? 'bg-blue-500 text-white'
+                  : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+              }`}
+              disabled={isRecording || !isBrowserSupported}
+            >
+              System Audio
+            </button>
+          </div>
+
+          {/* Error display */}
+          {error && (
+            <div className="w-full p-4 mb-4 bg-red-100 text-red-700 rounded">
+              <p className="font-medium">Error:</p>
+              <p>{error}</p>
+              {error.includes('denied') && (
+                <p className="mt-2 text-sm">
+                  Tip: Look for the {recordingMode === 'microphone' ? 'microphone' : 'screen share'} icon in your browser's address bar to grant permission.
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* Audio level meter */}
+          <div className="w-full max-w-md mb-4">
+            <div className="h-2 bg-gray-200 rounded overflow-hidden">
+              <div 
+                className="h-full bg-green-500 transition-all duration-100"
+                style={{ width: `${audioLevel}%` }}
+              />
+            </div>
+            <div className="flex justify-between text-xs text-gray-500 mt-1">
+              <span>Audio Level</span>
+              <span>{Math.round(audioLevel)}%</span>
+            </div>
+          </div>
+
+          {/* Control buttons */}
+          <div className="flex gap-4">
+            <button
+              onClick={isRecording ? stopRecording : startRecording}
+              className={`px-6 py-2 rounded-full text-white font-semibold transition-colors ${
+                isRecording 
+                  ? 'bg-red-500 hover:bg-red-600' 
+                  : 'bg-blue-500 hover:bg-blue-600'
+              }`}
+              disabled={isPlaying || !isBrowserSupported}
+            >
+              {isRecording ? 'Stop Recording' : `Start ${recordingMode} Recording`}
+            </button>
+
+            {hasRecording && !isRecording && (
+              <button
+                onClick={isPlaying ? stopAudio : playAudio}
+                className={`px-6 py-2 rounded-full text-white font-semibold transition-colors ${
+                  isPlaying 
+                    ? 'bg-yellow-500 hover:bg-yellow-600' 
+                    : 'bg-green-500 hover:bg-green-600'
+                }`}
+              >
+                {isPlaying ? 'Stop Playing' : 'Play Recording'}
+              </button>
+            )}
+          </div>
+
+          {/* Status indicators */}
+          <div className="mt-4 text-sm">
+            {isRecording && (
+              <div className="flex items-center gap-2 text-red-500">
+                <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse"></div>
+                Recording {recordingMode} audio...
               </div>
-            ) : (
-              <div>
-                <div className="mb-4">
-                  To record audio, you&apos;ll need to:
-                </div>
-                <ol className="list-decimal ml-6 mb-4">
-                  <li>Click &quot;Allow&quot; when prompted for microphone access</li>
-                  <li>Make sure your microphone is working and not muted</li>
-                  <li>Stay on this page while recording</li>
-                </ol>
-                <div className="flex justify-end gap-2">
-                  <button
-                    onClick={() => setShowPermissionModal(false)}
-                    className="px-4 py-2 text-gray-600 hover:text-gray-800"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    onClick={requestPermission}
-                    className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
-                  >
-                    Continue
-                  </button>
-                </div>
+            )}
+            {isPlaying && (
+              <div className="flex items-center gap-2 text-green-500">
+                <div className="w-3 h-3 bg-green-500 rounded-full animate-pulse"></div>
+                Playing recording...
               </div>
             )}
           </div>
-        </div>
+
+          {/* Hidden audio element */}
+          <audio
+            ref={audioRef}
+            style={{ display: 'none' }}
+            onEnded={() => {
+              console.log('Audio playback ended');
+              setIsPlaying(false);
+            }}
+            onError={(e) => {
+              const error = e.currentTarget.error;
+              console.error('Audio element error:', error);
+              setError(`Audio playback error: ${error?.message || 'Unknown error'}`);
+              setIsPlaying(false);
+            }}
+          />
+        </>
       )}
-
-      <h2 className="text-2xl font-bold text-gray-800">Audio Recorder</h2>
-      <p className="text-sm text-gray-600 text-center mb-4">
-        Record audio including background sounds. Adjust sensitivity using the slider below.
-      </p>
-      
-      <div className="w-full max-w-xs mb-4">
-        <label htmlFor="gain-control" className="block text-sm font-medium text-gray-700 mb-1">
-          Microphone Sensitivity
-        </label>
-        <input
-          id="gain-control"
-          type="range"
-          min={0.5}
-          max={4}
-          step={0.5}
-          value={gainValue}
-          onChange={adjustGain}
-          className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
-          disabled={isRecording}
-        />
-        <div className="flex justify-between text-xs text-gray-500">
-          <span>Low</span>
-          <span>High</span>
-        </div>
-      </div>
-
-      <div className="flex gap-4">
-        {!isRecording ? (
-          <button
-            onClick={startRecording}
-            className="px-6 py-2 text-white bg-red-500 rounded-full hover:bg-red-600 transition-colors"
-          >
-            Start Recording
-          </button>
-        ) : (
-          <button
-            onClick={stopRecording}
-            className="px-6 py-2 text-white bg-gray-500 rounded-full hover:bg-gray-600 transition-colors"
-          >
-            Stop Recording
-          </button>
-        )}
-
-        {audioData && (
-          <>
-            {!isPlaying ? (
-              <button
-                onClick={playRecording}
-                className="px-6 py-2 text-white bg-green-500 rounded-full hover:bg-green-600 transition-colors"
-              >
-                Play Recording
-              </button>
-            ) : (
-              <button
-                onClick={stopPlayback}
-                className="px-6 py-2 text-white bg-gray-500 rounded-full hover:bg-gray-600 transition-colors"
-              >
-                Stop Playback
-              </button>
-            )}
-          </>
-        )}
-      </div>
-
-      <div className="mt-4">
-        {isRecording && (
-          <div className="flex items-center gap-2 text-red-500">
-            <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse"></div>
-            Recording...
-          </div>
-        )}
-      </div>
     </div>
   );
 } 
