@@ -45,55 +45,76 @@ export default function AudioRecorder() {
       setPermissionError(null);
       setShowPermissionModal(false);
 
-      // Platform detection for Mac-specific settings
+      // Platform detection
       const isMac = /Mac/.test(navigator.platform);
+      const isWindows = /Win/.test(navigator.platform);
+      console.log('Platform detection:', { isMac, isWindows, platform: navigator.platform });
 
-      // Optimized audio constraints for background noise capture on Mac
-      const stream = await navigator.mediaDevices.getUserMedia({
+      // Platform-specific audio constraints
+      const audioConstraints = isMac ? {
+        // Mac-specific constraints - simplified for better compatibility
         audio: {
-          echoCancellation: false,      // Disable to capture ambient sound
-          noiseSuppression: false,      // Disable to preserve background noise
-          autoGainControl: false,       // Manual gain control for better sensitivity
-          channelCount: 2,              // Stereo recording
-          sampleRate: isMac ? 96000 : 48000,  // Higher sample rate for Mac
-          sampleSize: 24,               // Higher bit depth for better quality
-          deviceId: undefined,          // Let user select input device if multiple available
+          echoCancellation: true,      // Enable on Mac for better stability
+          noiseSuppression: true,      // Enable on Mac for better stability
+          autoGainControl: true,       // Enable on Mac for better stability
+          channelCount: 1,             // Mono for Mac (more stable)
+          sampleRate: 44100,           // Standard sample rate for Mac
         }
-      });
+      } : {
+        // Windows constraints - keep existing settings that work
+        audio: {
+          echoCancellation: false,     // Disable for better background noise capture
+          noiseSuppression: false,     // Disable for background noise
+          autoGainControl: false,      // Manual gain control
+          channelCount: 2,             // Stereo recording
+          sampleRate: 48000,           // Higher sample rate
+          sampleSize: 24               // Higher bit depth
+        }
+      };
 
-      // Initialize audio context with high-quality settings
+      console.log('Using audio constraints:', audioConstraints);
+
+      // Request audio with platform-specific constraints
+      const stream = await navigator.mediaDevices.getUserMedia(audioConstraints);
+
+      // Initialize audio context with platform-specific settings
       const AudioContext = window.AudioContext || window.webkitAudioContext;
       audioContextRef.current = new AudioContext({
-        sampleRate: isMac ? 96000 : 48000,
-        latencyHint: 'interactive'
+        sampleRate: isMac ? 44100 : 48000, // Standard rate for Mac, high for Windows
+        latencyHint: isMac ? 'playback' : 'interactive'
       });
 
-      // Create audio source from the stream
+      // Create audio source
       audioSourceRef.current = audioContextRef.current.createMediaStreamSource(stream);
       
-      // Create and configure gain node with higher initial gain for Mac
+      // Create and configure gain node with platform-specific defaults
       gainNodeRef.current = audioContextRef.current.createGain();
-      gainNodeRef.current.gain.value = isMac ? 2.0 : gainValue; // Higher default gain for Mac
+      gainNodeRef.current.gain.value = isMac ? 1.8 : gainValue; // Higher default for Mac
       
-      // Create analyzer node for monitoring audio levels
-      const analyzerNode = audioContextRef.current.createAnalyser();
-      analyzerNode.fftSize = 2048;
-      analyzerNode.smoothingTimeConstant = 0.8;
-
       // Create destination
       audioDestinationRef.current = audioContextRef.current.createMediaStreamDestination();
       
-      // Connect the enhanced audio graph
+      // Connect the audio graph
       audioSourceRef.current
         .connect(gainNodeRef.current)
-        .connect(analyzerNode)
         .connect(audioDestinationRef.current);
 
-      // Use higher bitrate for Mac
-      const mediaRecorder = new MediaRecorder(audioDestinationRef.current.stream, {
+      // Platform-specific MediaRecorder settings
+      const options: MediaRecorderOptions & { mimeType?: string } = {
         mimeType: 'audio/webm;codecs=opus',
-        bitsPerSecond: isMac ? 256000 : 128000 // Higher bitrate for Mac
-      });
+        bitsPerSecond: isMac ? 128000 : 256000 // Lower bitrate for Mac for stability
+      };
+
+      // Verify format support
+      if (!MediaRecorder.isTypeSupported(options.mimeType || '')) {
+        console.log('Fallback to default media type');
+        options.mimeType = undefined; // Let browser choose format
+      }
+
+      console.log('MediaRecorder options:', options);
+
+      // Create MediaRecorder with platform-specific settings
+      const mediaRecorder = new MediaRecorder(audioDestinationRef.current.stream, options);
 
       mediaRecorderRef.current = mediaRecorder;
       audioChunksRef.current = [];
@@ -104,26 +125,40 @@ export default function AudioRecorder() {
         }
       };
 
-      mediaRecorder.onstop = () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-        const audioUrl = URL.createObjectURL(audioBlob);
-        setAudioData({ blob: audioBlob, url: audioUrl });
-        
-        // Cleanup
-        if (audioContextRef.current) {
-          audioSourceRef.current?.disconnect();
-          gainNodeRef.current?.disconnect();
-          analyzerNode.disconnect();
-          audioContextRef.current.close().catch(console.error);
-          audioContextRef.current = null;
-        }
-        
-        // Stop all tracks
-        stream.getTracks().forEach(track => track.stop());
+      // Add error handling for MediaRecorder
+      mediaRecorder.onerror = (event) => {
+        console.error('MediaRecorder error:', event);
+        stopRecording();
+        setPermissionError('Recording error occurred. Please try again.');
+        setShowPermissionModal(true);
       };
 
-      // Smaller chunks for more frequent updates, especially important for Mac
-      mediaRecorder.start(50);
+      mediaRecorder.onstop = () => {
+        try {
+          const audioBlob = new Blob(audioChunksRef.current, { 
+            type: options.mimeType || 'audio/webm' 
+          });
+          const audioUrl = URL.createObjectURL(audioBlob);
+          setAudioData({ blob: audioBlob, url: audioUrl });
+          
+          // Cleanup
+          if (audioContextRef.current) {
+            audioSourceRef.current?.disconnect();
+            gainNodeRef.current?.disconnect();
+            audioContextRef.current.close().catch(console.error);
+            audioContextRef.current = null;
+          }
+          
+          stream.getTracks().forEach(track => track.stop());
+        } catch (error) {
+          console.error('Error in onstop handler:', error);
+          setPermissionError('Error finishing recording. Please try again.');
+          setShowPermissionModal(true);
+        }
+      };
+
+      // Platform-specific chunk size
+      mediaRecorder.start(isMac ? 100 : 50); // Larger chunks for Mac
       setIsRecording(true);
 
     } catch (error: unknown) {
@@ -133,9 +168,13 @@ export default function AudioRecorder() {
       
       if (error instanceof Error) {
         if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
-          errorMessage = 'Permission to record audio was denied. Please check your Mac privacy settings and grant microphone access.';
+          errorMessage = isMac 
+            ? 'Please check System Preferences > Security & Privacy > Microphone and ensure browser access is enabled.'
+            : 'Permission to record audio was denied. Please grant permission to continue.';
         } else if (error.name === 'NotSupportedError') {
-          errorMessage = 'Audio recording is not supported. Please ensure you are using Safari 14+ or Chrome on your Mac.';
+          errorMessage = isMac
+            ? 'Please use Safari 14+ or latest Chrome on your Mac.'
+            : 'Please use Chrome or Edge on Windows.';
         } else if (error.message) {
           errorMessage = error.message;
         }
