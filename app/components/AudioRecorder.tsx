@@ -41,14 +41,14 @@ export default function AudioRecorder() {
   }, [audioData]);
 
   const requestPermission = async () => {
+    // Platform detection moved outside try block
+    const isMac = /Mac/.test(navigator.platform);
+    const isWindows = /Win/.test(navigator.platform);
+    console.log('Platform detection:', { isMac, isWindows, platform: navigator.platform });
+
     try {
       setPermissionError(null);
       setShowPermissionModal(false);
-
-      // Platform detection
-      const isMac = /Mac/.test(navigator.platform);
-      const isWindows = /Win/.test(navigator.platform);
-      console.log('Platform detection:', { isMac, isWindows, platform: navigator.platform });
 
       // Platform-specific audio constraints
       const audioConstraints = isMac ? {
