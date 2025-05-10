@@ -55,149 +55,185 @@ export default function AudioRecorder() {
     // Platform and browser detection
     const isMac = /Mac/.test(navigator.platform);
     const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+    const isChrome = /Chrome/.test(navigator.userAgent);
+    
     const browserInfo = {
       isMac,
       isSafari,
+      isChrome,
       userAgent: navigator.userAgent,
       platform: navigator.platform,
       vendor: navigator.vendor
     };
-    
-    console.log('Environment detection:', browserInfo);
-    
-    // Track recording attempt
+
     posthog.capture('audio_recording_attempt', browserInfo);
 
     try {
       setPermissionError(null);
       setShowPermissionModal(false);
 
-      // Check for MediaRecorder and audio support
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        const error = 'Audio recording not supported in this browser';
-        posthog.capture('audio_support_error', { 
-          error,
+      // First try to get audio permission with basic constraints
+      try {
+        const initialStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        initialStream.getTracks().forEach(track => track.stop());
+        posthog.capture('basic_permission_granted', browserInfo);
+      } catch (permError) {
+        posthog.capture('basic_permission_error', {
+          error: permError instanceof Error ? permError.message : 'Unknown error',
           ...browserInfo
         });
-        throw new Error(error);
+        throw permError;
       }
 
-      // Browser-specific audio constraints
-      const audioConstraints = {
+      // Mac-specific audio constraints
+      const macConstraints = {
         audio: {
-          // Safari/Mac specific settings
-          ...(isSafari || isMac ? {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-            channelCount: 1,
-            sampleRate: 44100,
-          } : {
-            echoCancellation: false,
-            noiseSuppression: false,
-            autoGainControl: false,
-            channelCount: 2,
-            sampleRate: 48000,
-            sampleSize: 24
-          })
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+          sampleRate: 44100,
         }
       };
 
-      posthog.capture('audio_constraints_set', { 
-        constraints: audioConstraints,
+      // Windows/Chrome constraints
+      const defaultConstraints = {
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          channelCount: 2,
+          sampleRate: 48000,
+          sampleSize: 24
+        }
+      };
+
+      // Try Mac-specific constraints first if on Mac
+      let stream;
+      let usedConstraints;
+      
+      if (isMac) {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia(macConstraints);
+          usedConstraints = macConstraints;
+          posthog.capture('mac_constraints_success', { constraints: macConstraints, ...browserInfo });
+        } catch (macError) {
+          posthog.capture('mac_constraints_failed', {
+            error: macError instanceof Error ? macError.message : 'Unknown error',
+            constraints: macConstraints,
+            ...browserInfo
+          });
+          // Fallback to default constraints
+          stream = await navigator.mediaDevices.getUserMedia(defaultConstraints);
+          usedConstraints = defaultConstraints;
+        }
+      } else {
+        stream = await navigator.mediaDevices.getUserMedia(defaultConstraints);
+        usedConstraints = defaultConstraints;
+      }
+
+      posthog.capture('audio_stream_created', {
+        constraints: usedConstraints,
         ...browserInfo
       });
 
-      // Request audio with browser-specific constraints
-      const stream = await navigator.mediaDevices.getUserMedia(audioConstraints);
-      posthog.capture('audio_permission_granted', browserInfo);
-
-      // Initialize audio context with browser-specific settings
+      // Initialize audio context
       const AudioContext = window.AudioContext || window.webkitAudioContext;
       if (!AudioContext) {
-        const error = 'WebAudio API not supported';
-        posthog.capture('audio_context_error', {
-          error,
-          ...browserInfo
-        });
-        throw new Error(error);
+        throw new Error('WebAudio API not supported');
       }
 
+      // Close existing audio context if any
       if (audioContextRef.current) {
         try {
           await audioContextRef.current.close();
         } catch (err) {
           console.error('Error closing previous audio context:', err);
-          posthog.capture('audio_context_close_error', {
-            error: err,
-            ...browserInfo
-          });
         }
       }
 
+      // Create new audio context with platform-specific settings
       audioContextRef.current = new AudioContext({
-        sampleRate: (isSafari || isMac) ? 44100 : 48000,
-        latencyHint: (isSafari || isMac) ? 'playback' : 'interactive'
+        sampleRate: isMac ? 44100 : 48000,
+        latencyHint: isMac ? 'playback' : 'interactive'
       });
 
-      // Create and configure audio nodes
+      // Wait for audio context to be ready
+      if (audioContextRef.current.state === 'suspended') {
+        await audioContextRef.current.resume();
+      }
+
+      // Set up audio processing chain
       audioSourceRef.current = audioContextRef.current.createMediaStreamSource(stream);
       gainNodeRef.current = audioContextRef.current.createGain();
-      gainNodeRef.current.gain.value = (isSafari || isMac) ? 1.5 : gainValue;
+      gainNodeRef.current.gain.value = isMac ? 1.8 : gainValue;
       audioDestinationRef.current = audioContextRef.current.createMediaStreamDestination();
 
-      // Connect audio graph
+      // Add a compressor node for better audio quality
+      const compressor = audioContextRef.current.createDynamicsCompressor();
+      compressor.threshold.value = -50;
+      compressor.knee.value = 40;
+      compressor.ratio.value = 12;
+      compressor.attack.value = 0;
+      compressor.release.value = 0.25;
+
+      // Connect audio graph with compressor
       audioSourceRef.current
         .connect(gainNodeRef.current)
+        .connect(compressor)
         .connect(audioDestinationRef.current);
 
-      posthog.capture('audio_graph_setup_complete', browserInfo);
+      posthog.capture('audio_processing_chain_created', { ...browserInfo });
 
-      // Determine supported mime types
-      let mimeType = 'audio/webm;codecs=opus';
-      const supportedMimeTypes = [
+      // Determine best supported format
+      const formats = [
         'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/mp4;codecs=opus',
         'audio/mp4',
         'audio/ogg;codecs=opus',
-        'audio/webm'
+        'audio/ogg',
+        'audio/wav'
       ];
 
-      for (const type of supportedMimeTypes) {
-        if (MediaRecorder.isTypeSupported(type)) {
-          mimeType = type;
-          break;
-        }
+      let selectedFormat = formats.find(format => MediaRecorder.isTypeSupported(format));
+      
+      if (!selectedFormat) {
+        posthog.capture('no_supported_format', browserInfo);
+        throw new Error('No supported audio format found');
       }
 
-      posthog.capture('mime_type_selected', {
-        mimeType,
-        supported: supportedMimeTypes.filter(type => MediaRecorder.isTypeSupported(type)),
-        ...browserInfo
+      posthog.capture('format_selected', { format: selectedFormat, ...browserInfo });
+
+      // Create MediaRecorder with selected format
+      const mediaRecorder = new MediaRecorder(audioDestinationRef.current.stream, {
+        mimeType: selectedFormat,
+        bitsPerSecond: isMac ? 128000 : 256000
       });
 
-      const options = {
-        mimeType,
-        bitsPerSecond: (isSafari || isMac) ? 128000 : 256000
-      };
-
-      const mediaRecorder = new MediaRecorder(audioDestinationRef.current.stream, options);
       mediaRecorderRef.current = mediaRecorder;
       audioChunksRef.current = [];
 
+      let recordingStartTime = Date.now();
+      let lastChunkTime = recordingStartTime;
+
       mediaRecorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
+          const now = Date.now();
           audioChunksRef.current.push(event.data);
-          posthog.capture('audio_chunk_received', {
+          posthog.capture('chunk_received', {
             chunkSize: event.data.size,
+            chunkDuration: now - lastChunkTime,
+            totalDuration: now - recordingStartTime,
             totalChunks: audioChunksRef.current.length,
             ...browserInfo
           });
+          lastChunkTime = now;
         }
       };
 
       mediaRecorder.onerror = (event) => {
-        console.error('MediaRecorder error:', event);
-        posthog.capture('media_recorder_error', {
+        posthog.capture('recorder_error', {
           error: event.error?.message || 'Unknown error',
           ...browserInfo
         });
@@ -208,14 +244,14 @@ export default function AudioRecorder() {
 
       mediaRecorder.onstop = () => {
         try {
-          const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
+          const audioBlob = new Blob(audioChunksRef.current, { type: selectedFormat });
           const audioUrl = URL.createObjectURL(audioBlob);
           setAudioData({ blob: audioBlob, url: audioUrl });
-          
+
           posthog.capture('recording_completed', {
             duration: Date.now() - recordingStartTime,
             fileSize: audioBlob.size,
-            mimeType: audioBlob.type,
+            format: selectedFormat,
             ...browserInfo
           });
 
@@ -226,11 +262,11 @@ export default function AudioRecorder() {
             audioContextRef.current.close().catch(console.error);
             audioContextRef.current = null;
           }
-          
+
           stream.getTracks().forEach(track => track.stop());
         } catch (error) {
           console.error('Error in onstop handler:', error);
-          posthog.capture('recording_completion_error', {
+          posthog.capture('completion_error', {
             error: error instanceof Error ? error.message : 'Unknown error',
             ...browserInfo
           });
@@ -239,11 +275,14 @@ export default function AudioRecorder() {
         }
       };
 
-      const recordingStartTime = Date.now();
-      mediaRecorder.start((isSafari || isMac) ? 100 : 50);
+      // Start recording with platform-specific settings
+      const chunkSize = isMac ? 100 : 50;
+      mediaRecorder.start(chunkSize);
       setIsRecording(true);
+      
       posthog.capture('recording_started', {
-        ...options,
+        format: selectedFormat,
+        chunkSize,
         ...browserInfo
       });
 
@@ -257,20 +296,23 @@ export default function AudioRecorder() {
         if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
           errorType = 'permission_denied';
           errorMessage = isMac 
-            ? 'Please check System Preferences > Security & Privacy > Microphone and ensure browser access is enabled.'
+            ? 'Please open System Preferences > Security & Privacy > Privacy > Microphone and ensure your browser is enabled.'
             : 'Permission to record audio was denied. Please grant permission to continue.';
         } else if (error.name === 'NotSupportedError') {
           errorType = 'browser_not_supported';
           errorMessage = isMac
-            ? 'Please use Safari 14+ or latest Chrome on your Mac.'
+            ? 'Please try using Safari 14+ or the latest version of Chrome on your Mac.'
             : 'Please use Chrome or Edge on Windows.';
+        } else if (error.name === 'NotReadableError' || error.name === 'NotFoundError') {
+          errorType = 'device_error';
+          errorMessage = 'Unable to access your microphone. Please check your microphone connection and settings.';
         } else {
           errorType = error.name;
           errorMessage = error.message;
         }
       }
       
-      posthog.capture('audio_recording_error', {
+      posthog.capture('setup_error', {
         errorType,
         errorMessage,
         error: error instanceof Error ? error.message : 'Unknown error',
