@@ -94,26 +94,41 @@ export default function AudioRecorder() {
       });
       micStreamRef.current = micStream;
 
-      // Get system audio stream
+      // Get system audio stream with specific constraints for macOS
       const displayStream = await navigator.mediaDevices.getDisplayMedia({
-        audio: true,
+        audio: {
+          // macOS specific audio constraints
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          sampleRate: 44100,
+          channelCount: 2
+        },
         video: {
-          width: 1,
-          height: 1,
-          frameRate: 1
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+          frameRate: { ideal: 30 }
         }
       });
 
+      // Check for audio track
       const systemAudioTrack = displayStream.getAudioTracks()[0];
       if (!systemAudioTrack) {
-        throw new Error('No system audio selected. Please make sure to check "Share audio".');
+        displayStream.getTracks().forEach(track => track.stop());
+        throw new Error(
+          'No system audio detected. For macOS:\n' +
+          '1. Click "Share screen"\n' +
+          '2. Select either "Chrome Tab" or "Desktop"\n' +
+          '3. IMPORTANT: Check "Share audio" at the bottom\n' +
+          '4. For Desktop sharing, select "Entire Screen"'
+        );
       }
 
       // Create a new stream with only the system audio track
       const systemStream = new MediaStream([systemAudioTrack]);
       systemStreamRef.current = systemStream;
 
-      // Stop the video track
+      // Stop video tracks to save resources
       displayStream.getVideoTracks().forEach(track => track.stop());
 
       // Create audio sources and merger
@@ -140,9 +155,20 @@ export default function AudioRecorder() {
     } catch (err) {
       if (err instanceof Error) {
         if (err.name === 'NotAllowedError') {
-          throw new Error('Access was denied. Please allow both microphone and system audio access.');
+          throw new Error(
+            'Access denied. For macOS:\n' +
+            '1. Allow microphone access if prompted\n' +
+            '2. When sharing screen, select "Entire Screen"\n' +
+            '3. Make sure to check "Share audio" option\n' +
+            '4. Click "Share" to confirm'
+          );
         } else if (err.name === 'NotSupportedError') {
-          throw new Error('Combined audio recording is not supported in your browser. Please try using Chrome or Edge.');
+          throw new Error(
+            'System audio recording not supported. For macOS:\n' +
+            '1. Use Chrome or Edge browser\n' +
+            '2. Make sure you have latest browser version\n' +
+            '3. Try selecting a different audio source'
+          );
         }
       }
       throw err;
@@ -164,26 +190,55 @@ export default function AudioRecorder() {
         return micStream;
 
       case 'system':
-        const displayStream = await navigator.mediaDevices.getDisplayMedia({
-          audio: true,
-          video: {
-            width: 1,
-            height: 1,
-            frameRate: 1
+        try {
+          // For macOS, we need specific constraints
+          const displayStream = await navigator.mediaDevices.getDisplayMedia({
+            audio: {
+              echoCancellation: false,
+              noiseSuppression: false,
+              autoGainControl: false,
+              sampleRate: 44100,
+              channelCount: 2
+            },
+            video: {
+              width: { ideal: 640 },
+              height: { ideal: 480 },
+              frameRate: { ideal: 30 }
+            }
+          });
+
+          const audioTrack = displayStream.getAudioTracks()[0];
+          if (!audioTrack) {
+            displayStream.getTracks().forEach(track => track.stop());
+            throw new Error(
+              'No system audio detected. For macOS:\n' +
+              '1. Click "Share screen"\n' +
+              '2. Select either "Chrome Tab" or "Desktop"\n' +
+              '3. IMPORTANT: Check "Share audio" at the bottom\n' +
+              '4. For Desktop sharing, select "Entire Screen"'
+            );
           }
-        });
 
-        const audioTrack = displayStream.getAudioTracks()[0];
-        if (!audioTrack) {
-          displayStream.getTracks().forEach(track => track.stop());
-          throw new Error('No system audio was selected. Please select a tab or window with audio and make sure to check "Share audio".');
+          const systemStream = new MediaStream([audioTrack]);
+          systemStreamRef.current = systemStream;
+          
+          // Stop video tracks
+          displayStream.getVideoTracks().forEach(track => track.stop());
+          
+          return systemStream;
+        } catch (err) {
+          if (err instanceof Error) {
+            if (err.name === 'NotAllowedError') {
+              throw new Error(
+                'Screen sharing denied. For macOS:\n' +
+                '1. When sharing screen, select "Entire Screen"\n' +
+                '2. Make sure to check "Share audio" option\n' +
+                '3. Click "Share" to confirm'
+              );
+            }
+          }
+          throw err;
         }
-
-        const systemStream = new MediaStream([audioTrack]);
-        systemStreamRef.current = systemStream;
-        
-        displayStream.getVideoTracks().forEach(track => track.stop());
-        return systemStream;
 
       case 'both':
         return getCombinedAudioStream();
@@ -397,16 +452,15 @@ export default function AudioRecorder() {
             </button>
           </div>
 
-          {/* Error display */}
+          {/* Error display with better formatting */}
           {error && (
             <div className="w-full p-4 mb-4 bg-red-100 text-red-700 rounded">
               <p className="font-medium">Error:</p>
-              <p>{error}</p>
-              {error.includes('denied') && (
-                <p className="mt-2 text-sm">
-                  Tip: Look for the {recordingMode === 'microphone' ? 'microphone' : 'screen share'} icon in your browser's address bar to grant permission.
+              {error.split('\n').map((line, index) => (
+                <p key={index} className={index === 0 ? 'mb-2' : 'ml-4 text-sm'}>
+                  {line}
                 </p>
-              )}
+              ))}
             </div>
           )}
 
