@@ -45,40 +45,54 @@ export default function AudioRecorder() {
       setPermissionError(null);
       setShowPermissionModal(false);
 
-      // Request audio with specific constraints for better background noise capture
+      // Platform detection for Mac-specific settings
+      const isMac = /Mac/.test(navigator.platform);
+
+      // Optimized audio constraints for background noise capture on Mac
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
-          echoCancellation: false, // Disable echo cancellation to capture more ambient sound
-          noiseSuppression: false, // Disable noise suppression to capture background noise
-          autoGainControl: false,  // We'll handle gain manually
-          channelCount: 2,         // Stereo recording
-          sampleRate: 48000,       // Higher sample rate
-          sampleSize: 24          // Higher bit depth
+          echoCancellation: false,      // Disable to capture ambient sound
+          noiseSuppression: false,      // Disable to preserve background noise
+          autoGainControl: false,       // Manual gain control for better sensitivity
+          channelCount: 2,              // Stereo recording
+          sampleRate: isMac ? 96000 : 48000,  // Higher sample rate for Mac
+          sampleSize: 24,               // Higher bit depth for better quality
+          deviceId: undefined,          // Let user select input device if multiple available
         }
       });
 
-      // Initialize audio context
-      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
-      
+      // Initialize audio context with high-quality settings
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      audioContextRef.current = new AudioContext({
+        sampleRate: isMac ? 96000 : 48000,
+        latencyHint: 'interactive'
+      });
+
       // Create audio source from the stream
       audioSourceRef.current = audioContextRef.current.createMediaStreamSource(stream);
       
-      // Create and configure gain node
+      // Create and configure gain node with higher initial gain for Mac
       gainNodeRef.current = audioContextRef.current.createGain();
-      gainNodeRef.current.gain.value = gainValue;
+      gainNodeRef.current.gain.value = isMac ? 2.0 : gainValue; // Higher default gain for Mac
       
+      // Create analyzer node for monitoring audio levels
+      const analyzerNode = audioContextRef.current.createAnalyser();
+      analyzerNode.fftSize = 2048;
+      analyzerNode.smoothingTimeConstant = 0.8;
+
       // Create destination
       audioDestinationRef.current = audioContextRef.current.createMediaStreamDestination();
       
-      // Connect the audio graph
+      // Connect the enhanced audio graph
       audioSourceRef.current
         .connect(gainNodeRef.current)
+        .connect(analyzerNode)
         .connect(audioDestinationRef.current);
 
-      // Create MediaRecorder with high bitrate
+      // Use higher bitrate for Mac
       const mediaRecorder = new MediaRecorder(audioDestinationRef.current.stream, {
         mimeType: 'audio/webm;codecs=opus',
-        bitsPerSecond: 128000 // Higher bitrate for better quality
+        bitsPerSecond: isMac ? 256000 : 128000 // Higher bitrate for Mac
       });
 
       mediaRecorderRef.current = mediaRecorder;
@@ -99,7 +113,8 @@ export default function AudioRecorder() {
         if (audioContextRef.current) {
           audioSourceRef.current?.disconnect();
           gainNodeRef.current?.disconnect();
-          audioContextRef.current.close();
+          analyzerNode.disconnect();
+          audioContextRef.current.close().catch(console.error);
           audioContextRef.current = null;
         }
         
@@ -107,8 +122,10 @@ export default function AudioRecorder() {
         stream.getTracks().forEach(track => track.stop());
       };
 
-      mediaRecorder.start(100); // Smaller chunks for more frequent updates
+      // Smaller chunks for more frequent updates, especially important for Mac
+      mediaRecorder.start(50);
       setIsRecording(true);
+
     } catch (error: unknown) {
       console.error('Error accessing audio:', error);
       
@@ -116,9 +133,9 @@ export default function AudioRecorder() {
       
       if (error instanceof Error) {
         if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
-          errorMessage = 'Permission to record audio was denied. Please grant permission to continue.';
+          errorMessage = 'Permission to record audio was denied. Please check your Mac privacy settings and grant microphone access.';
         } else if (error.name === 'NotSupportedError') {
-          errorMessage = 'Your browser does not support audio recording. Please try using Chrome or Edge.';
+          errorMessage = 'Audio recording is not supported. Please ensure you are using Safari 14+ or Chrome on your Mac.';
         } else if (error.message) {
           errorMessage = error.message;
         }
