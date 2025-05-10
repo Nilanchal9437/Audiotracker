@@ -9,11 +9,12 @@ export default function AudioRecorder() {
   const [hasRecording, setHasRecording] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [audioLevel, setAudioLevel] = useState(0);
-  const [recordingMode, setRecordingMode] = useState<'microphone' | 'system'>('microphone');
+  const [recordingMode, setRecordingMode] = useState<'microphone' | 'system' | 'both'>('microphone');
 
   // Refs
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const systemStreamRef = useRef<MediaStream | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
@@ -40,8 +41,11 @@ export default function AudioRecorder() {
   useEffect(() => {
     return () => {
       stopRecording();
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(track => track.stop());
+      if (micStreamRef.current) {
+        micStreamRef.current.getTracks().forEach(track => track.stop());
+      }
+      if (systemStreamRef.current) {
+        systemStreamRef.current.getTracks().forEach(track => track.stop());
       }
       if (audioContextRef.current) {
         audioContextRef.current.close();
@@ -68,36 +72,98 @@ export default function AudioRecorder() {
     animationFrameRef.current = requestAnimationFrame(updateAudioLevel);
   };
 
-  // Get audio stream based on mode
-  const getAudioStream = async () => {
+  // Get combined audio stream
+  const getCombinedAudioStream = async () => {
     if (!isBrowserSupported) {
       throw new Error('Your browser does not support audio recording');
     }
 
-    if (recordingMode === 'microphone') {
-      try {
-        return await navigator.mediaDevices.getUserMedia({
+    try {
+      // Create audio context
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      const audioContext = new AudioContextClass();
+      audioContextRef.current = audioContext;
+
+      // Get microphone stream
+      const micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
+      micStreamRef.current = micStream;
+
+      // Get system audio stream
+      const displayStream = await navigator.mediaDevices.getDisplayMedia({
+        audio: true,
+        video: {
+          width: 1,
+          height: 1,
+          frameRate: 1
+        }
+      });
+
+      const systemAudioTrack = displayStream.getAudioTracks()[0];
+      if (!systemAudioTrack) {
+        throw new Error('No system audio selected. Please make sure to check "Share audio".');
+      }
+
+      // Create a new stream with only the system audio track
+      const systemStream = new MediaStream([systemAudioTrack]);
+      systemStreamRef.current = systemStream;
+
+      // Stop the video track
+      displayStream.getVideoTracks().forEach(track => track.stop());
+
+      // Create audio sources and merger
+      const micSource = audioContext.createMediaStreamSource(micStream);
+      const systemSource = audioContext.createMediaStreamSource(systemStream);
+      const merger = audioContext.createChannelMerger(2);
+
+      // Connect sources to merger
+      micSource.connect(merger, 0, 0);
+      systemSource.connect(merger, 0, 1);
+
+      // Create analyzer for audio levels
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 256;
+      merger.connect(analyser);
+      analyserRef.current = analyser;
+
+      // Create MediaStream from merged audio
+      const dest = audioContext.createMediaStreamDestination();
+      merger.connect(dest);
+
+      return dest.stream;
+
+    } catch (err) {
+      if (err instanceof Error) {
+        if (err.name === 'NotAllowedError') {
+          throw new Error('Access was denied. Please allow both microphone and system audio access.');
+        } else if (err.name === 'NotSupportedError') {
+          throw new Error('Combined audio recording is not supported in your browser. Please try using Chrome or Edge.');
+        }
+      }
+      throw err;
+    }
+  };
+
+  // Get audio stream based on mode
+  const getAudioStream = async () => {
+    switch (recordingMode) {
+      case 'microphone':
+        const micStream = await navigator.mediaDevices.getUserMedia({
           audio: {
             echoCancellation: true,
             noiseSuppression: true,
             autoGainControl: true
           }
         });
-      } catch (err) {
-        if (err instanceof Error) {
-          if (err.name === 'NotAllowedError') {
-            throw new Error('Microphone access was denied. Please allow microphone access to record.');
-          } else if (err.name === 'NotFoundError') {
-            throw new Error('No microphone found. Please connect a microphone and try again.');
-          } else if (err.name === 'NotSupportedError') {
-            throw new Error('Audio recording is not supported in your browser. Please try using Chrome or Edge.');
-          }
-        }
-        throw err;
-      }
-    } else {
-      try {
-        // For system audio, we need to request both audio and video (but we'll only use audio)
+        micStreamRef.current = micStream;
+        return micStream;
+
+      case 'system':
         const displayStream = await navigator.mediaDevices.getDisplayMedia({
           audio: true,
           video: {
@@ -107,30 +173,23 @@ export default function AudioRecorder() {
           }
         });
 
-        // Check if audio was included in the stream
         const audioTrack = displayStream.getAudioTracks()[0];
         if (!audioTrack) {
           displayStream.getTracks().forEach(track => track.stop());
           throw new Error('No system audio was selected. Please select a tab or window with audio and make sure to check "Share audio".');
         }
 
-        // Create a new stream with only the audio track
-        const audioStream = new MediaStream([audioTrack]);
+        const systemStream = new MediaStream([audioTrack]);
+        systemStreamRef.current = systemStream;
         
-        // Stop the video track since we don't need it
         displayStream.getVideoTracks().forEach(track => track.stop());
-        
-        return audioStream;
-      } catch (err) {
-        if (err instanceof Error) {
-          if (err.name === 'NotAllowedError') {
-            throw new Error('System audio sharing was denied. Please allow audio sharing and make sure to check "Share audio".');
-          } else if (err.name === 'NotSupportedError') {
-            throw new Error('System audio recording is not supported in your browser. Please try using Chrome or Edge.');
-          }
-        }
-        throw err;
-      }
+        return systemStream;
+
+      case 'both':
+        return getCombinedAudioStream();
+
+      default:
+        throw new Error('Invalid recording mode');
     }
   };
 
@@ -149,24 +208,8 @@ export default function AudioRecorder() {
       const stream = await getAudioStream();
       console.log('Audio access granted');
 
-      // Set up audio context and analyzer
-      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-      const audioContext = new AudioContextClass();
-      const analyser = audioContext.createAnalyser();
-      const source = audioContext.createMediaStreamSource(stream);
-      
-      analyser.fftSize = 256;
-      source.connect(analyser);
-      
-      audioContextRef.current = audioContext;
-      analyserRef.current = analyser;
-      streamRef.current = stream;
-
-      // Start monitoring audio levels
-      updateAudioLevel();
-
       try {
-        // Create MediaRecorder with default settings first
+        // Create MediaRecorder with default settings
         const recorder = new MediaRecorder(stream);
         
         recorder.ondataavailable = (e) => {
@@ -180,6 +223,8 @@ export default function AudioRecorder() {
           console.log('Recording started successfully');
           setIsRecording(true);
           setError(null);
+          // Start audio level monitoring
+          updateAudioLevel();
         };
 
         recorder.onstop = () => {
@@ -211,10 +256,12 @@ export default function AudioRecorder() {
           if (animationFrameRef.current) {
             cancelAnimationFrame(animationFrameRef.current);
           }
-          stream.getTracks().forEach(track => {
-            console.log('Stopping track:', track.kind, track.label);
-            track.stop();
-          });
+          if (micStreamRef.current) {
+            micStreamRef.current.getTracks().forEach(track => track.stop());
+          }
+          if (systemStreamRef.current) {
+            systemStreamRef.current.getTracks().forEach(track => track.stop());
+          }
           setAudioLevel(0);
           setIsRecording(false);
         };
@@ -224,8 +271,11 @@ export default function AudioRecorder() {
           setError(`Recording error: ${event.error?.message || 'Unknown error'}`);
           setIsRecording(false);
           setAudioLevel(0);
-          if (stream) {
-            stream.getTracks().forEach(track => track.stop());
+          if (micStreamRef.current) {
+            micStreamRef.current.getTracks().forEach(track => track.stop());
+          }
+          if (systemStreamRef.current) {
+            systemStreamRef.current.getTracks().forEach(track => track.stop());
           }
         };
 
@@ -247,8 +297,11 @@ export default function AudioRecorder() {
       setError(err instanceof Error ? err.message : 'Failed to start recording');
       setIsRecording(false);
       setAudioLevel(0);
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(track => track.stop());
+      if (micStreamRef.current) {
+        micStreamRef.current.getTracks().forEach(track => track.stop());
+      }
+      if (systemStreamRef.current) {
+        systemStreamRef.current.getTracks().forEach(track => track.stop());
       }
       if (audioContextRef.current) {
         audioContextRef.current.close();
@@ -316,7 +369,7 @@ export default function AudioRecorder() {
                   ? 'bg-blue-500 text-white'
                   : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
               }`}
-              disabled={isRecording || !isBrowserSupported}
+              disabled={isRecording}
             >
               Microphone
             </button>
@@ -327,9 +380,20 @@ export default function AudioRecorder() {
                   ? 'bg-blue-500 text-white'
                   : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
               }`}
-              disabled={isRecording || !isBrowserSupported}
+              disabled={isRecording}
             >
               System Audio
+            </button>
+            <button
+              onClick={() => setRecordingMode('both')}
+              className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                recordingMode === 'both'
+                  ? 'bg-blue-500 text-white'
+                  : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+              }`}
+              disabled={isRecording}
+            >
+              Both
             </button>
           </div>
 
@@ -369,7 +433,7 @@ export default function AudioRecorder() {
                   ? 'bg-red-500 hover:bg-red-600' 
                   : 'bg-blue-500 hover:bg-blue-600'
               }`}
-              disabled={isPlaying || !isBrowserSupported}
+              disabled={isPlaying}
             >
               {isRecording ? 'Stop Recording' : `Start ${recordingMode} Recording`}
             </button>
