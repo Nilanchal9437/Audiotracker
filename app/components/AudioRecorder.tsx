@@ -41,81 +41,88 @@ export default function AudioRecorder() {
   }, [audioData]);
 
   const requestPermission = async () => {
-    // Platform detection moved outside try block
+    // Platform and browser detection
     const isMac = /Mac/.test(navigator.platform);
-    const isWindows = /Win/.test(navigator.platform);
-    console.log('Platform detection:', { isMac, isWindows, platform: navigator.platform });
+    const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+    console.log('Environment detection:', { isMac, isSafari, userAgent: navigator.userAgent });
 
     try {
       setPermissionError(null);
       setShowPermissionModal(false);
 
-      // Platform-specific audio constraints
-      const audioConstraints = isMac ? {
-        // Mac-specific constraints - simplified for better compatibility
+      // Browser-specific audio constraints
+      const audioConstraints = {
         audio: {
-          echoCancellation: true,      // Enable on Mac for better stability
-          noiseSuppression: true,      // Enable on Mac for better stability
-          autoGainControl: true,       // Enable on Mac for better stability
-          channelCount: 1,             // Mono for Mac (more stable)
-          sampleRate: 44100,           // Standard sample rate for Mac
-        }
-      } : {
-        // Windows constraints - keep existing settings that work
-        audio: {
-          echoCancellation: false,     // Disable for better background noise capture
-          noiseSuppression: false,     // Disable for background noise
-          autoGainControl: false,      // Manual gain control
-          channelCount: 2,             // Stereo recording
-          sampleRate: 48000,           // Higher sample rate
-          sampleSize: 24               // Higher bit depth
+          // Safari/Mac specific settings
+          ...(isSafari || isMac ? {
+            echoCancellation: true,    // Enable for Safari stability
+            noiseSuppression: true,    // Enable for Safari stability
+            autoGainControl: true,     // Enable for Safari stability
+            channelCount: 1,           // Mono for Safari
+            sampleRate: 44100,         // Standard rate for Safari
+          } : {
+            // Windows/Chrome settings
+            echoCancellation: false,   // Capture background noise
+            noiseSuppression: false,   // Preserve background sounds
+            autoGainControl: false,    // Manual gain control
+            channelCount: 2,           // Stereo
+            sampleRate: 48000,         // Higher quality
+            sampleSize: 24            // Better depth
+          })
         }
       };
 
       console.log('Using audio constraints:', audioConstraints);
 
-      // Request audio with platform-specific constraints
+      // Request audio with browser-specific constraints
       const stream = await navigator.mediaDevices.getUserMedia(audioConstraints);
 
-      // Initialize audio context with platform-specific settings
+      // Initialize audio context with browser-specific settings
       const AudioContext = window.AudioContext || window.webkitAudioContext;
+      if (audioContextRef.current) {
+        try {
+          await audioContextRef.current.close();
+        } catch (err) {
+          console.error('Error closing previous audio context:', err);
+        }
+      }
+
       audioContextRef.current = new AudioContext({
-        sampleRate: isMac ? 44100 : 48000, // Standard rate for Mac, high for Windows
-        latencyHint: isMac ? 'playback' : 'interactive'
+        sampleRate: (isSafari || isMac) ? 44100 : 48000,
+        latencyHint: (isSafari || isMac) ? 'playback' : 'interactive'
       });
 
-      // Create audio source
+      // Create and configure audio nodes
       audioSourceRef.current = audioContextRef.current.createMediaStreamSource(stream);
-      
-      // Create and configure gain node with platform-specific defaults
       gainNodeRef.current = audioContextRef.current.createGain();
-      gainNodeRef.current.gain.value = isMac ? 1.8 : gainValue; // Higher default for Mac
-      
-      // Create destination
+      gainNodeRef.current.gain.value = (isSafari || isMac) ? 1.5 : gainValue;
       audioDestinationRef.current = audioContextRef.current.createMediaStreamDestination();
-      
-      // Connect the audio graph
+
+      // Connect audio graph
       audioSourceRef.current
         .connect(gainNodeRef.current)
         .connect(audioDestinationRef.current);
 
-      // Platform-specific MediaRecorder settings
-      const options: MediaRecorderOptions & { mimeType?: string } = {
-        mimeType: 'audio/webm;codecs=opus',
-        bitsPerSecond: isMac ? 128000 : 256000 // Lower bitrate for Mac for stability
-      };
-
-      // Verify format support
-      if (!MediaRecorder.isTypeSupported(options.mimeType || '')) {
-        console.log('Fallback to default media type');
-        options.mimeType = undefined; // Let browser choose format
+      // Determine supported mime types
+      let mimeType = 'audio/webm;codecs=opus';
+      if (!MediaRecorder.isTypeSupported(mimeType)) {
+        if (MediaRecorder.isTypeSupported('audio/mp4')) {
+          mimeType = 'audio/mp4';
+        } else if (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) {
+          mimeType = 'audio/ogg;codecs=opus';
+        } else if (MediaRecorder.isTypeSupported('audio/webm')) {
+          mimeType = 'audio/webm';
+        }
       }
+
+      const options = {
+        mimeType,
+        bitsPerSecond: (isSafari || isMac) ? 128000 : 256000
+      };
 
       console.log('MediaRecorder options:', options);
 
-      // Create MediaRecorder with platform-specific settings
       const mediaRecorder = new MediaRecorder(audioDestinationRef.current.stream, options);
-
       mediaRecorderRef.current = mediaRecorder;
       audioChunksRef.current = [];
 
@@ -125,7 +132,6 @@ export default function AudioRecorder() {
         }
       };
 
-      // Add error handling for MediaRecorder
       mediaRecorder.onerror = (event) => {
         console.error('MediaRecorder error:', event);
         stopRecording();
@@ -135,9 +141,7 @@ export default function AudioRecorder() {
 
       mediaRecorder.onstop = () => {
         try {
-          const audioBlob = new Blob(audioChunksRef.current, { 
-            type: options.mimeType || 'audio/webm' 
-          });
+          const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
           const audioUrl = URL.createObjectURL(audioBlob);
           setAudioData({ blob: audioBlob, url: audioUrl });
           
@@ -157,8 +161,8 @@ export default function AudioRecorder() {
         }
       };
 
-      // Platform-specific chunk size
-      mediaRecorder.start(isMac ? 100 : 50); // Larger chunks for Mac
+      // Use larger chunks for Safari/Mac
+      mediaRecorder.start((isSafari || isMac) ? 100 : 50);
       setIsRecording(true);
 
     } catch (error: unknown) {
