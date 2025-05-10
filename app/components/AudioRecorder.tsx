@@ -24,6 +24,23 @@ interface AudioData {
   deviceInfo: any;
 }
 
+interface AudioMetricsBatch {
+  sessionId: string;
+  metrics: Array<{
+    average: number;
+    peak: number;
+    timestamp: number;
+  }>;
+}
+
+interface AudioChunkBatch {
+  sessionId: string;
+  chunks: Array<{
+    size: number;
+    timestamp: number;
+  }>;
+}
+
 declare global {
   interface Window {
     webkitAudioContext: typeof AudioContext;
@@ -46,6 +63,9 @@ export default function AudioRecorder() {
   const audioBufferSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const recordingSessionRef = useRef<string>('');
+  const metricsBufferRef = useRef<AudioMetricsBatch['metrics']>([]);
+  const chunksBufferRef = useRef<AudioChunkBatch['chunks']>([]);
+  const lastBatchSentRef = useRef<number>(Date.now());
 
   useEffect(() => {
     return () => {
@@ -61,6 +81,32 @@ export default function AudioRecorder() {
   // Function to generate a unique session ID
   const generateSessionId = () => {
     return 'rec-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
+  };
+
+  const sendBatchedData = () => {
+    const now = Date.now();
+    // Only send batch if it's been at least 2 seconds since last batch
+    if (now - lastBatchSentRef.current >= 2000) {
+      if (metricsBufferRef.current.length > 0) {
+        posthog.capture('audio_metrics_batch', {
+          sessionId: recordingSessionRef.current,
+          metrics: metricsBufferRef.current,
+          timestamp: now
+        });
+        metricsBufferRef.current = [];
+      }
+
+      if (chunksBufferRef.current.length > 0) {
+        posthog.capture('audio_chunks_batch', {
+          sessionId: recordingSessionRef.current,
+          chunks: chunksBufferRef.current,
+          timestamp: now
+        });
+        chunksBufferRef.current = [];
+      }
+
+      lastBatchSentRef.current = now;
+    }
   };
 
   const requestPermission = async () => {
@@ -122,19 +168,20 @@ export default function AudioRecorder() {
       
       processor.onaudioprocess = (e) => {
         const inputData = e.inputBuffer.getChannelData(0);
-        
-        // Calculate audio levels using Array.from for TypeScript compatibility
         const dataArray = Array.from(inputData);
         const sum = dataArray.reduce((acc, val) => acc + Math.abs(val), 0);
         const average = sum / dataArray.length;
+        const peak = Math.max(...dataArray);
         
-        // Send audio metrics to PostHog
-        posthog.capture('audio_levels', {
-          sessionId,
+        // Add to metrics buffer instead of sending immediately
+        metricsBufferRef.current.push({
           average,
-          peak: Math.max(...dataArray),
+          peak,
           timestamp: Date.now()
         });
+        
+        // Try to send batch
+        sendBatchedData();
       };
 
       // Connect nodes
@@ -159,26 +206,32 @@ export default function AudioRecorder() {
       mediaRecorderRef.current = mediaRecorder;
       audioChunksRef.current = [];
 
+      // Start recording with timeslice parameter
+      mediaRecorder.start(500); // Record in 500ms chunks
+      setIsRecording(true);
+
       mediaRecorder.ondataavailable = async (event) => {
         if (event.data.size > 0) {
           audioChunksRef.current.push(event.data);
           
-          // Send chunk to PostHog
-          const chunk = await event.data.arrayBuffer();
-          posthog.capture('audio_chunk', {
-            sessionId,
-            chunkSize: event.data.size,
-            chunkData: Array.from(new Uint8Array(chunk)),
+          // Instead of sending immediately, batch the chunk info
+          chunksBufferRef.current.push({
+            size: event.data.size,
             timestamp: Date.now()
           });
+          
+          // Try to send batch
+          sendBatchedData();
         }
       };
 
       mediaRecorder.onstop = async () => {
+        // Force send any remaining batched data
+        sendBatchedData();
+        
         const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
         const audioUrl = URL.createObjectURL(audioBlob);
         
-        // Store audio data with metadata
         const audioMetadata: AudioData = {
           blob: audioBlob,
           url: audioUrl,
@@ -188,13 +241,12 @@ export default function AudioRecorder() {
         
         setAudioData(audioMetadata);
 
-        // Send complete recording to PostHog
-        const audioBuffer = await audioBlob.arrayBuffer();
+        // Send final recording data
         posthog.capture('recording_completed', {
-          sessionId,
-          audioData: Array.from(new Uint8Array(audioBuffer)),
+          sessionId: recordingSessionRef.current,
           duration: Date.now() - recordingStartTime,
-          metadata: audioMetadata
+          finalSize: audioBlob.size,
+          timestamp: Date.now()
         });
 
         // Cleanup
@@ -211,8 +263,6 @@ export default function AudioRecorder() {
       };
 
       const recordingStartTime = Date.now();
-      mediaRecorder.start(100);
-      setIsRecording(true);
 
     } catch (error) {
       console.error('Recording error:', error);
